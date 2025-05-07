@@ -1,14 +1,15 @@
 package main
 
 import (
+	"bufio"
 	// "context"
 	"fmt"
-	// "io"
+	"io"
 	"log"
-	// "net/http"
+	"net/http"
 	"os"
-	// "strings"
-	// "time"
+	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	// "github.com/jackc/pgx/v5/pgxpool"
@@ -18,84 +19,91 @@ import (
 // SCRAPER
 //
 
-func can_scrape_domain(domain *string) {
-	// urls := []string{
-	// 	fmt.Sprintf("https://%s/robots.txt", domain),
-	// 	fmt.Sprintf("http://%s/robots.txt", domain),
-	// }
+func can_scrape_domain(domain *string) bool {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
 
-	// var resp *http.Response
-	// var err error
-	// var finalURL string
+	var resp *http.Response
+	var err error
+	// supportsHttps := false
 
-	// for _, url := range urls {
-	// 	resp, err = client.Get(url)
-	// 	if err == nil {
-	// 		finalURL = url
-	// 		break
-	// 	}
-	// }
+	resp, err = client.Get(fmt.Sprintf("https://%s/robots.txt", *domain))
+	if err == nil {
+		// supportsHttps = true
+	} else {
+		resp, err = client.Get(fmt.Sprintf("http://%s/robots.txt", *domain))
+	}
 
-	// if err != nil {
-	// 	fmt.Printf("!!! [%s] Failed to fetch robots.txt: %v\n", domain, err)
-	// 	continue
-	// }
-	// defer resp.Body.Close()
+	if err != nil {
+		fmt.Printf("!!! [%s] Failed to fetch robots.txt: %v\n", *domain, err)
+		return false
+	}
+	defer resp.Body.Close()
 
-	// body, err := io.ReadAll(resp.Body)
-	// if err != nil {
-	// 	fmt.Printf("!!! [%s] Failed to read response: %v\n", domain, err)
-	// 	continue
-	// }
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("!!! [%s] Failed to read response: %v\n", *domain, err)
+		return false
+	}
 
-	// robotsTxt := string(body)
-	// scrapingAllowed := true
+	robotsTxt := string(body)
+	scrapingAllowed := true
 
-	// lines := strings.Split(robotsTxt, "\n")
-	// for i := 0; i < len(lines); i++ {
-	// 	line := strings.TrimSpace(lines[i])
-	// 	if strings.HasPrefix(line, "User-agent:") {
-	// 		agent := strings.TrimSpace(strings.TrimPrefix(line, "User-agent:"))
-	// 		if agent == "*" {
-	// 			for j := i + 1; j < len(lines); j++ {
-	// 				nextLine := strings.TrimSpace(lines[j])
-	// 				if strings.HasPrefix(nextLine, "User-agent:") {
-	// 					break
-	// 				}
-	// 				if strings.HasPrefix(nextLine, "Disallow:") {
-	// 					path := strings.TrimSpace(strings.TrimPrefix(nextLine, "Disallow:"))
-	// 					if path == "/" {
-	// 						scrapingAllowed = false
-	// 						break
-	// 					}
-	// 				}
-	// 			}
-	// 			break
-	// 		}
-	// 	}
-	// }
+	lines := strings.Split(robotsTxt, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "User-agent:") {
+			agent := strings.TrimSpace(strings.TrimPrefix(line, "User-agent:"))
+			if agent == "*" {
+				for j := i + 1; j < len(lines); j++ {
+					nextLine := strings.TrimSpace(lines[j])
+					if strings.HasPrefix(nextLine, "User-agent:") {
+						break
+					}
+					if strings.HasPrefix(nextLine, "Disallow:") {
+						path := strings.TrimSpace(strings.TrimPrefix(nextLine, "Disallow:"))
+						if path == "/" {
+							scrapingAllowed = false
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+	}
 
-	// return scrapingAllowed
+	return scrapingAllowed
 }
 
 func scrape_domain(domain *string) {
-	fmt.Printf("scraping %s\n", *domain)
+	scrapingAllowed := can_scrape_domain(domain)
+	if scrapingAllowed {
+		fmt.Printf("scraping %s allowed\n", *domain)
+	} else {
+		fmt.Printf("scraping %s disallowed\n", *domain)
+	}
 }
 
 func scrape_from_file(filename *string) {
-	fmt.Printf("scraping from %s\n", *filename)
+	file, err := os.Open(*filename)
+	if err != nil {
+        log.Fatal(err)
+    }
+    defer file.Close()
 
-	// client := &http.Client{
-	// 	Timeout: 5 * time.Second,
-	// }
+	scanner := bufio.NewScanner(file)
 
-	// for _, domain := range strings.Split(strings.TrimRight(string(million), "\n"), "\n") {
-	// 	if domain == "" {
-	// 		continue
-	// 	}
+	// TODO: parallelize
+	for scanner.Scan() {
+		domain := scanner.Text()
+        scrape_domain(&domain)
+    }
 
-	// 	scrape_domain(&domain)
-	// }
+	if err := scanner.Err(); err != nil {
+        log.Fatal(err)
+    }
 }
 
 //
