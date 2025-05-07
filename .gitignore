@@ -9,4 +9,4 @@ go.work.sum
 bloop
 
 # downloadable data
-src/data
+data
