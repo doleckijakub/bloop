@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"unicode"
 	"bytes"
 	"time"
@@ -22,13 +23,149 @@ import (
 )
 
 //
+// CACHE STRUCTURES
+//
+
+type DomainCache struct {
+	sync.RWMutex
+	data map[string]struct {
+		id       int
+		isHttps  bool
+		exists   bool
+	}
+}
+
+func NewDomainCache() *DomainCache {
+	return &DomainCache{
+		data: make(map[string]struct {
+			id       int
+			isHttps  bool
+			exists   bool
+		}),
+	}
+}
+
+func (c *DomainCache) Get(domain string) (int, bool, bool) {
+	c.RLock()
+	defer c.RUnlock()
+	entry, exists := c.data[domain]
+	return entry.id, entry.isHttps, exists && entry.exists
+}
+
+func (c *DomainCache) Set(domain string, id int, isHttps bool) {
+	c.Lock()
+	defer c.Unlock()
+	c.data[domain] = struct {
+		id       int
+		isHttps  bool
+		exists   bool
+	}{id, isHttps, true}
+}
+
+type StemCache struct {
+	sync.RWMutex
+	data map[string]string
+}
+
+func NewStemCache() *StemCache {
+	return &StemCache{
+		data: make(map[string]string),
+	}
+}
+
+func (c *StemCache) Get(word string) (string, bool) {
+	c.RLock()
+	defer c.RUnlock()
+	stem, exists := c.data[word]
+	return stem, exists
+}
+
+func (c *StemCache) Set(word, stem string) {
+	c.Lock()
+	defer c.Unlock()
+	c.data[word] = stem
+}
+
+type ScrapedPathsCache struct {
+	sync.RWMutex
+	data map[string]map[string]struct{}
+}
+
+func NewScrapedPathsCache() *ScrapedPathsCache {
+	return &ScrapedPathsCache{
+		data: make(map[string]map[string]struct{}),
+	}
+}
+
+func (c *ScrapedPathsCache) Add(domain, path string) {
+	c.Lock()
+	defer c.Unlock()
+	if _, exists := c.data[domain]; !exists {
+		c.data[domain] = make(map[string]struct{})
+	}
+	c.data[domain][path] = struct{}{}
+}
+
+func (c *ScrapedPathsCache) Contains(domain, path string) bool {
+	c.RLock()
+	defer c.RUnlock()
+	paths, exists := c.data[domain]
+	if !exists {
+		return false
+	}
+	_, exists = paths[path]
+	return exists
+}
+
+func (c *ScrapedPathsCache) ClearDomain(domain string) {
+	c.Lock()
+	defer c.Unlock()
+	delete(c.data, domain)
+}
+
+type RobotsCache struct {
+	sync.RWMutex
+	data map[string][]string
+}
+
+func NewRobotsCache() *RobotsCache {
+	return &RobotsCache{
+		data: make(map[string][]string),
+	}
+}
+
+func (c *RobotsCache) Get(domain string) ([]string, bool) {
+	c.RLock()
+	defer c.RUnlock()
+	paths, exists := c.data[domain]
+	return paths, exists
+}
+
+func (c *RobotsCache) Set(domain string, paths []string) {
+	c.Lock()
+	defer c.Unlock()
+	c.data[domain] = paths
+}
+
+//
 // SCRAPER
 //
 
-var db *pgxpool.Pool
-const MAX_SCRAPE_RECURSION_DEPTH = 4 // TODO: 10
+var (
+	db               *pgxpool.Pool
+	domainCache      = NewDomainCache()
+	stemCache        = NewStemCache()
+	scrapedPaths     = NewScrapedPathsCache()
+	robotsCache      = NewRobotsCache()
+)
+
+const MAX_SCRAPE_RECURSION_DEPTH = 1
 
 func registerDomain(ctx context.Context, domain string) {
+	if _, _, exists := domainCache.Get(domain); exists {
+		return
+	}
+
 	var exists bool
 	err := db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM domains WHERE domain = $1)`, domain).Scan(&exists)
 	if err != nil {
@@ -36,6 +173,7 @@ func registerDomain(ctx context.Context, domain string) {
 		return
 	}
 	if exists {
+		domainCache.Set(domain, 0, false)
 		return
 	}
 
@@ -55,13 +193,22 @@ func registerDomain(ctx context.Context, domain string) {
 		}
 	}
 
-	_, err = db.Exec(ctx, `INSERT INTO domains (domain, is_https) VALUES ($1, $2)`, domain, supportsHttps)
+	var domainID int
+	err = db.QueryRow(ctx, `INSERT INTO domains (domain, is_https) VALUES ($1, $2) RETURNING domain_id`, 
+		domain, supportsHttps).Scan(&domainID)
 	if err != nil {
 		fmt.Printf("[%s] failed to insert domain: %v\n", domain, err)
+		return
 	}
+
+	domainCache.Set(domain, domainID, supportsHttps)
 }
 
 func getDisallowedPaths(domain string) ([]string, error) {
+	if paths, exists := robotsCache.Get(domain); exists {
+		return paths, nil
+	}
+
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 	}
@@ -108,13 +255,19 @@ func getDisallowedPaths(domain string) ([]string, error) {
 		}
 	}
 
+	robotsCache.Set(domain, disallowedPaths)
 	return disallowedPaths, nil
 }
 
 func getStem(ctx context.Context, word string) (string, error) {
+	if stem, exists := stemCache.Get(word); exists {
+		return stem, nil
+	}
+
 	var stem string
 	err := db.QueryRow(ctx, `SELECT stem FROM stems WHERE word = $1`, word).Scan(&stem)
 	if err == nil {
+		stemCache.Set(word, stem)
 		return stem, nil
 	}
 	if err.Error() != "no rows in result set" {
@@ -127,6 +280,7 @@ func getStem(ctx context.Context, word string) (string, error) {
 		if insertErr != nil {
 			return "", insertErr
 		}
+		stemCache.Set(word, stem)
 		return stem, nil
 	} else {
 		return "", err
@@ -158,6 +312,11 @@ func scrape_url(ctx context.Context, domain string, path string, disallowedPaths
 		return
 	}
 
+	if scrapedPaths.Contains(domain, path) {
+		fmt.Printf("[%s%s] already scraped (cached), skipping\n", domain, path)
+		return
+	}
+
 	var exists bool
 	err := db.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -168,22 +327,21 @@ func scrape_url(ctx context.Context, domain string, path string, disallowedPaths
 	if err != nil {
 		fmt.Printf("[] query failed: %v\n", err)
 	} else if exists {
-		fmt.Printf("[%s] %s already scraped, skipping\n", domain, path)
+		scrapedPaths.Add(domain, path)
+		fmt.Printf("[%s%s] already scraped, skipping\n", domain, path)
 		return
 	}
 
 	for _, disallowedPath := range disallowedPaths {
 		if strings.HasPrefix(path, disallowedPath) {
-			fmt.Printf("[%s] %s scraping disallowed (Disallow: %s), skipping\n", domain, path, disallowedPath)
+			fmt.Printf("[%s%s] scraping disallowed (Disallow: %s), skipping\n", domain, path, disallowedPath)
 			return
 		}
 	}
 
-	var isHttps bool
-	var domainID int
-	err = db.QueryRow(ctx, `SELECT domain_id, is_https FROM domains WHERE domain = $1`, domain).Scan(&domainID, &isHttps)
-	if err != nil {
-		fmt.Printf("[] query failed: %v\n", err)
+	domainID, isHttps, exists := domainCache.Get(domain)
+	if !exists {
+		fmt.Printf("[%s] domain not registered, skipping\n", domain)
 		return
 	}
 
@@ -194,25 +352,25 @@ func scrape_url(ctx context.Context, domain string, path string, disallowedPaths
 
 	resp, err := http.Get(protocol + "://" + domain + path)
 	if err != nil {
-		fmt.Printf("[%s] %s failed to fetch: %v\n", domain, path, err)
+		fmt.Printf("[%s%s] failed to fetch: %v\n", domain, path, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("[%s] %s non-200 status %d for\n", domain, path, resp.StatusCode)
+		fmt.Printf("[%s%s] non-200 status %d\n", domain, path, resp.StatusCode)
 		return
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("[%s] %s failed to read the response: %v\n", domain, path, err)
+		fmt.Printf("[%s%s] failed to read the response: %v\n", domain, path, err)
 		return
 	}
 
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
-		fmt.Printf("[%s] %s failed to parse the response: %v\n", domain, path, err)
+		fmt.Printf("[%s%s] failed to parse the response: %v\n", domain, path, err)
 		return
 	}
 
@@ -221,21 +379,21 @@ func scrape_url(ctx context.Context, domain string, path string, disallowedPaths
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
-		fmt.Printf("[%s] %s failed to begin a transaction: %v\n", domain, path, err)
+		fmt.Printf("[%s%s] failed to begin a transaction: %v\n", domain, path, err)
 		return
 	}
 	defer tx.Rollback(ctx)
 
 	_, err = tx.Exec(ctx, `INSERT INTO pages (domain_id, url_path) VALUES ($1, $2)`, domainID, path)
 	if err != nil {
-		fmt.Printf("[%s] %s insert failed: %v\n", domain, path, err)
+		fmt.Printf("[%s%s] insert failed: %v\n", domain, path, err)
 		return
 	}
 
 	var pageID int
 	err = tx.QueryRow(ctx, `SELECT page_id FROM pages WHERE domain_id = $1 AND url_path = $2`, domainID, path).Scan(&pageID)
 	if err != nil {
-		fmt.Printf("[%s] %s query failed: %v\n", domain, path, err)
+		fmt.Printf("[%s%s] query failed: %v\n", domain, path, err)
 		return
 	}
 
@@ -255,23 +413,25 @@ func scrape_url(ctx context.Context, domain string, path string, disallowedPaths
 			ON CONFLICT (term) DO UPDATE SET document_frequency = terms.document_frequency + 1
 			RETURNING term_id`, term).Scan(&termID)
 		if err != nil {
-			fmt.Printf("[%s] %s insert failed: %v\n", domain, path, err)
+			fmt.Printf("[%s%s] insert failed: %v\n", domain, path, err)
 			return
 		}
 
 		_, err = tx.Exec(ctx, `INSERT INTO page_terms (page_id, term_id, term_frequency) VALUES ($1, $2, $3)`, 
 			pageID, termID, count)
 		if err != nil {
-			fmt.Printf("[%s] %s insert failed: %v\n", domain, path, err)
+			fmt.Printf("[%s%s] insert failed: %v\n", domain, path, err)
 			return
 		}
 	}
 
 	err = tx.Commit(ctx)
 	if err != nil {
-		fmt.Printf("[%s] %s commit failed: %v\n", domain, path, err)
+		fmt.Printf("[%s%s] commit failed: %v\n", domain, path, err)
 		return
 	}
+
+	scrapedPaths.Add(domain, path)
 
 	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
@@ -295,6 +455,8 @@ func scrape_url(ctx context.Context, domain string, path string, disallowedPaths
 
 func scrape_domain(domain string) {
 	ctx := context.Background()
+
+	scrapedPaths.ClearDomain(domain)
 
 	registerDomain(ctx, domain)
 
